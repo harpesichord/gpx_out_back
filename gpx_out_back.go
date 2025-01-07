@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 )
 
 // GPX structures
@@ -89,6 +90,75 @@ func findTurnaroundPoint(points []TrackPoint) (Point, int) {
 	return turnaroundPoint, turnaroundIndex
 }
 
+// findClosestTrackSegment finds the two track points that a waypoint lies between
+func findClosestTrackSegment(waypoint Point, points []TrackPoint, turnaroundIndex int) (Point, Point) {
+	minDist := math.MaxFloat64
+	var p1, p2 Point
+
+	// Only look at outbound portion of track
+	for i := 0; i < turnaroundIndex; i++ {
+		if i+1 >= len(points) {
+			break
+		}
+
+		// Calculate distance from waypoint to line segment between track points
+		curr := Point{points[i].Lat, points[i].Lon}
+		next := Point{points[i+1].Lat, points[i+1].Lon}
+
+		dist := distanceToSegment(waypoint, curr, next)
+		if dist < minDist {
+			minDist = dist
+			p1 = curr
+			p2 = next
+		}
+	}
+
+	return p1, p2
+}
+
+// distanceToSegment calculates the minimum distance from a point to a line segment
+func distanceToSegment(p, start, end Point) float64 {
+	// Convert to meters for more accurate distance calculation
+	const metersPerDegLat = 111111.0
+	px := p.Lon * metersPerDegLat * math.Cos(p.Lat*math.Pi/180.0)
+	py := p.Lat * metersPerDegLat
+	startx := start.Lon * metersPerDegLat * math.Cos(start.Lat*math.Pi/180.0)
+	starty := start.Lat * metersPerDegLat
+	endx := end.Lon * metersPerDegLat * math.Cos(end.Lat*math.Pi/180.0)
+	endy := end.Lat * metersPerDegLat
+
+	A := px - startx
+	B := py - starty
+	C := endx - startx
+	D := endy - starty
+
+	dot := A*C + B*D
+	len_sq := C*C + D*D
+
+	if len_sq == 0 {
+		// Start and end points are the same
+		return math.Sqrt(A*A + B*B)
+	}
+
+	param := dot / len_sq
+	var xx, yy float64
+
+	if param < 0 {
+		xx = startx
+		yy = starty
+	} else if param > 1 {
+		xx = endx
+		yy = endy
+	} else {
+		xx = startx + param*C
+		yy = starty + param*D
+	}
+
+	dx := px - xx
+	dy := py - yy
+	return math.Sqrt(dx*dx + dy*dy)
+}
+
 func offsetPoint(p1, p2 Point) Point {
 	lat1 := p1.Lat * math.Pi / 180
 	lon1 := p1.Lon * math.Pi / 180
@@ -112,24 +182,72 @@ func offsetPoint(p1, p2 Point) Point {
 	}
 }
 
+func createOutboundWaypoints(waypoints []Waypoint, points []TrackPoint, turnaroundPoint Point, turnaroundIndex int) []Waypoint {
+	var outboundWaypoints []Waypoint
+
+	for _, wp := range waypoints {
+		// Find the track segment this waypoint lies on
+		waypointPoint := Point{wp.Lat, wp.Lon}
+		trackPoint1, trackPoint2 := findClosestTrackSegment(waypointPoint, points, turnaroundIndex)
+
+		// Calculate offset using the same track segment
+		offset := offsetPoint(trackPoint1, trackPoint2)
+
+		// Create the outbound waypoint
+		name := wp.Name
+		name = strings.ReplaceAll(name, "Rtn", "Out")
+		if !strings.Contains(name, "Out") {
+			name = strings.TrimSpace(name) + " Out"
+		}
+
+		outboundWp := Waypoint{
+			Lat:  offset.Lat,
+			Lon:  offset.Lon,
+			Ele:  wp.Ele,
+			Name: name,
+			Type: wp.Type,
+		}
+		outboundWaypoints = append(outboundWaypoints, outboundWp)
+	}
+
+	// Add turnaround waypoint
+	turnaroundWp := Waypoint{
+		Lat:  turnaroundPoint.Lat,
+		Lon:  turnaroundPoint.Lon,
+		Ele:  0.0,
+		Name: "TURN AROUND",
+		Type: "GENERAL DISTANCE",
+	}
+	outboundWaypoints = append(outboundWaypoints, turnaroundWp)
+
+	return outboundWaypoints
+}
+
 func processGPX(gpxData *GPX) {
 	if len(gpxData.Tracks) == 0 || len(gpxData.Tracks[0].Segments) == 0 {
 		fmt.Println("No track data found in GPX file")
 		return
 	}
 
-	// Find turnaround point
+	// Get the first track segment
 	segment := &gpxData.Tracks[0].Segments[0]
-	turnaroundPoint, turnaroundIndex := findTurnaroundPoint(segment.Points)
 
-	// Create turnaround waypoint
-	gpxData.Waypoints = append(gpxData.Waypoints, Waypoint{
-		Lat:  turnaroundPoint.Lat,
-		Lon:  turnaroundPoint.Lon,
-		Ele:  0.0,
-		Name: "TURN AROUND",
-		Type: "GENERAL DISTANCE",
-	})
+	// Find turnaround point
+	turnaroundPoint, turnaroundIndex := findTurnaroundPoint(segment.Points)
+	fmt.Printf("Found turnaround point at index %d: %f, %f\n",
+		turnaroundIndex, turnaroundPoint.Lat, turnaroundPoint.Lon)
+
+	// Create outbound waypoints
+	outboundWaypoints := createOutboundWaypoints(
+		gpxData.Waypoints,
+		segment.Points,
+		turnaroundPoint,
+		turnaroundIndex,
+	)
+	fmt.Printf("Created %d outbound waypoints\n", len(outboundWaypoints))
+
+	// Add the new waypoints to the GPX data
+	gpxData.Waypoints = append(gpxData.Waypoints, outboundWaypoints...)
 
 	// Offset outbound track points
 	for i := 0; i < turnaroundIndex; i++ {
@@ -143,9 +261,9 @@ func processGPX(gpxData *GPX) {
 		}
 	}
 
-	fmt.Printf("Processed GPX file:\n")
-	fmt.Printf("- Found turnaround point at: %.6f, %.6f\n", turnaroundPoint.Lat, turnaroundPoint.Lon)
-	fmt.Printf("- Offset %d track points\n", turnaroundIndex)
+	fmt.Printf("Offset %d track points\n", turnaroundIndex)
+
+	fmt.Printf("Finished processing GPX file\n")
 }
 
 func main() {
